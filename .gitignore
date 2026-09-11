@@ -1,0 +1,34 @@
+# ---- model weights (too large for git; see README.md) ----
+models/spa/*
+models/dcr/*
+models/drd2/*
+!models/spa/.gitkeep
+!models/dcr/.gitkeep
+!models/drd2/.gitkeep
+
+# ---- logs ----
+log/
+*.log
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- IDE / OS ----
+.idea/
+.vscode/
+.DS_Store
+
+# ---- training artifacts ----
+mask_sft_model/
+env_sft_model/
+mask_grpo_model/
+env_grpo_model/
+spa_sft_model/
+dcr_sft_model/
+spa_grpo_model/
+dcr_grpo_model/
+trainer_output/
