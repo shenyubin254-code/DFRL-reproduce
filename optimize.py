@@ -1,12 +1,19 @@
+import csv
+import json
+import logging
 import re
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import torch
 import pandas as pd
+import transformers
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from rdkit import Chem, DataStructs
 from rdkit.Chem import QED, AllChem, Descriptors
+from rdkit import rdBase
 from tqdm import tqdm, trange
 from rdkit import RDLogger
 
@@ -32,6 +39,32 @@ if args.opti_object == "qeddrd2":
     args.opti_object = "qed&drd2"
 
 setup_seed(args.seed)
+
+if args.output_file:
+    output_file = Path(args.output_file)
+else:
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    output_file = Path("results") / (
+        f"optimized_{args.opti_object}_{args.epochs_test}_"
+        f"{int(10 * args.min_similar)}_{timestamp}.csv"
+    )
+details_dir = output_file.parent / f"{output_file.stem}_details"
+if output_file.exists() or details_dir.exists():
+    raise FileExistsError(
+        f"Experiment output already exists: {output_file}"
+    )
+output_file.parent.mkdir(parents=True, exist_ok=True)
+details_dir.mkdir(parents=True, exist_ok=False)
+history_file = details_dir / "best_history.csv"
+progress_file = details_dir / "progress.csv"
+metrics_file = details_dir / "epoch_metrics.csv"
+config_file = details_dir / "config.json"
+run_log_file = details_dir / "run.log"
+file_handler = logging.FileHandler(run_log_file, encoding="utf-8")
+file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s - %(levelname)s - %(message)s"
+))
+logger.addHandler(file_handler)
 
 logger.info("loading SPA model")
 tokenizer = AutoTokenizer.from_pretrained(args.spa_model_path, use_fast=False,
@@ -64,6 +97,35 @@ if args.data_fname_test == "":
 test_data, test_data_size = load_test_data(args)
 logger.info("loading test end")
 
+
+def get_git_info(*cmd):
+    try:
+        return subprocess.check_output(
+            ["git", *cmd],
+            text=True,
+            stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+config = {
+    "start_time": datetime.now().isoformat(),
+    "git_commit": get_git_info("rev-parse", "HEAD"),
+    "git_status": get_git_info("status", "--porcelain"),
+    "parameters": vars(args).copy(),
+    "test_data_size": test_data_size,
+    "mask_check": "author_original",
+    "python_version": sys.version,
+    "torch_version": torch.__version__,
+    "transformers_version": transformers.__version__,
+    "rdkit_version": rdBase.rdkitVersion,
+}
+config_file.write_text(
+    json.dumps(config, ensure_ascii=False, indent=2),
+    encoding="utf-8"
+)
+
 epochs = args.epochs_test
 swarm_num = args.swarm_num
 
@@ -83,19 +145,6 @@ def safe_decode(g_id, tknz):
     return tknz_list
 
 
-def is_valid_single_mask(source_smiles, masked_smiles):
-    if masked_smiles.count("<|mask|>") != 1:
-        return False
-
-    prefix, suffix = masked_smiles.split("<|mask|>")
-
-    return (
-        source_smiles.startswith(prefix)
-        and source_smiles.endswith(suffix)
-        and len(prefix) + len(suffix) < len(source_smiles)
-    )
-
-
 swarms = []
 swarms_qed = []
 swarms_logp = []
@@ -112,6 +161,38 @@ best_logp = []
 best_drd2 = []
 best_similar = []
 best_smiles = []
+
+
+def make_results_df():
+    return pd.DataFrame({
+        "input_smiles": test_data.smiles,
+        "optimized_smiles": best_smiles,
+        "initial_fitness": init_fitness,
+        "optimized_fitness": best_fitness,
+        "initial_qed": init_qed,
+        "optimized_qed": best_qed,
+        "initial_logp": init_logp,
+        "optimized_logp": best_logp,
+        "initial_drd2": init_drd2,
+        "optimized_drd2": best_drd2,
+        "similarity": best_similar,
+    })
+
+
+def atomic_save_csv(df, path):
+    temp_path = path.with_name(path.name + ".tmp")
+    df.to_csv(temp_path, index=False)
+    temp_path.replace(path)
+
+
+def append_csv_row(path, row):
+    is_new_file = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if is_new_file:
+            writer.writeheader()
+        writer.writerow(row)
+
 
 for step, one_sm in tqdm(enumerate(test_data.smiles), total=len(test_data.smiles), desc="init..."):
     swarms.append([one_sm] * swarm_num)
@@ -150,8 +231,16 @@ for step, one_sm in tqdm(enumerate(test_data.smiles), total=len(test_data.smiles
     best_similar.append(1)
     best_smiles.append(one_sm)
 
+initial_df = make_results_df()
+initial_df.insert(0, "epoch", 0)
+initial_df.insert(1, "molecule_id", range(len(initial_df)))
+atomic_save_csv(initial_df, progress_file)
+logger.info("Initial molecule results saved")
+
 for epoch_i in trange(0, epochs):
     valid_num = 0
+    mask_total_count = 0
+    mask_fallback_count = 0
 
     for step, one_swarm in enumerate(swarms):
 
@@ -198,26 +287,20 @@ for epoch_i in trange(0, epochs):
 
         one_swarm_mask = [one_smiles.replace('Q', '&') for one_smiles in one_swarm_mask]
 
+        mask_total_count += len(one_swarm_mask)
         for sss in range(len(one_swarm_mask)):
-            masked = one_swarm_mask[sss]
-            original = one_swarm[sss]
+            one_smiles = one_swarm_mask[sss]
 
-            if (
-                masked.count("<|mask|>") != 1
-                or "\n" in masked
-            ):
+            if ('<|mask|>' not in one_smiles) or ('\n' in one_smiles) or (one_smiles.count('<|mask|>') > 1):
                 one_swarm_mask[sss] = random_one_swarm_mask[sss]
+                mask_fallback_count += 1
                 continue
 
-            remained_chars = masked.replace("<|mask|>", "")
-
-            if not all(c in allowed_chars for c in remained_chars):
+            remained_chars = one_smiles.replace('<|mask|>', '')
+            is_legal = all(char in allowed_chars for char in remained_chars)
+            if not is_legal:
                 one_swarm_mask[sss] = random_one_swarm_mask[sss]
-                continue
-
-            if not is_valid_single_mask(original, masked):
-                one_swarm_mask[sss] = random_one_swarm_mask[sss]
-                continue
+                mask_fallback_count += 1
 
         new_one_swarm = []
         new_one_swarm_qed = []
@@ -353,8 +436,74 @@ for epoch_i in trange(0, epochs):
         swarms_logp[step] = top_5_swarm_logp
         swarms_drd2[step] = top_5_swarm_drd2
 
-logger.info("valid rate")
-logger.info(valid_num / (test_data_size * args.swarm_num))
+        history_row = {
+            "epoch": epoch_i + 1,
+            "molecule_id": step,
+            "input_smiles": test_data.smiles[step],
+            "optimized_smiles": best_smiles[step],
+            "initial_fitness": init_fitness[step],
+            "optimized_fitness": best_fitness[step],
+            "initial_qed": init_qed[step],
+            "optimized_qed": best_qed[step],
+            "initial_logp": init_logp[step],
+            "optimized_logp": best_logp[step],
+            "initial_drd2": init_drd2[step],
+            "optimized_drd2": best_drd2[step],
+            "similarity": best_similar[step],
+        }
+        append_csv_row(history_file, history_row)
+
+    progress_df = make_results_df()
+    progress_df.insert(0, "epoch", epoch_i + 1)
+    progress_df.insert(1, "molecule_id", range(len(progress_df)))
+    atomic_save_csv(progress_df, progress_file)
+
+    n = test_data_size
+    metrics_row = {
+        "epoch": epoch_i + 1,
+        "num_molecules": n,
+        "valid_generation_rate":
+            valid_num / (n * swarm_num),
+        "mask_fallback_count": mask_fallback_count,
+        "mask_fallback_rate":
+            mask_fallback_count / mask_total_count
+            if mask_total_count else 0,
+        "mean_qed": sum(best_qed) / n,
+        "mean_logp": sum(best_logp) / n,
+        "mean_drd2": sum(best_drd2) / n,
+        "mean_similarity": sum(best_similar) / n,
+        "mean_qed_improvement":
+            sum(a - b for a, b in zip(best_qed, init_qed)) / n,
+        "mean_logp_improvement":
+            sum(a - b for a, b in zip(best_logp, init_logp)) / n,
+        "mean_drd2_improvement":
+            sum(a - b for a, b in zip(best_drd2, init_drd2)) / n,
+        "qed_ge_0_9_percent":
+            100 * sum(x >= 0.9 for x in best_qed) / n,
+        "qed_delta_ge_0_1_percent":
+            100 * sum(
+                a - b >= 0.1
+                for a, b in zip(best_qed, init_qed)
+            ) / n,
+        "drd2_ge_0_5_percent":
+            100 * sum(x >= 0.5 for x in best_drd2) / n,
+        "drd2_delta_ge_0_2_percent":
+            100 * sum(
+                a - b >= 0.2
+                for a, b in zip(best_drd2, init_drd2)
+            ) / n,
+        "mo_success_percent":
+            100 * sum(
+                q > 0.6 and d > 0.5
+                for q, d in zip(best_qed, best_drd2)
+            ) / n,
+    }
+    append_csv_row(metrics_file, metrics_row)
+    logger.info(
+        f"Epoch {epoch_i + 1}/{epochs}: "
+        f"valid_rate={metrics_row['valid_generation_rate']:.4f}, "
+        f"mask_fallback_rate={metrics_row['mask_fallback_rate']:.4f}"
+    )
 
 qed_pairs = [[init_qed[i], best_qed[i]] for i in range(len(best_qed))]
 logp_pairs = [[init_logp[i], best_logp[i]] for i in range(len(best_logp))]
@@ -364,28 +513,7 @@ similar_pairs = [[1, best_similar[i]] for i in range(len(best_similar))]
 
 end_epoch_log(args, logger, qed_pairs, logp_pairs, drd2_pairs, fitness_pairs, similar_pairs)
 
-if args.output_file:
-    output_file = Path(args.output_file)
-else:
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    output_file = Path("results") / (
-        f"optimized_{args.opti_object}_{args.epochs_test}_{int(10 * args.min_similar)}_{timestamp}.csv"
-    )
-
-output_file.parent.mkdir(parents=True, exist_ok=True)
-pd.DataFrame({
-    "input_smiles": test_data.smiles,
-    "optimized_smiles": best_smiles,
-    "initial_fitness": init_fitness,
-    "optimized_fitness": best_fitness,
-    "initial_qed": init_qed,
-    "optimized_qed": best_qed,
-    "initial_logp": init_logp,
-    "optimized_logp": best_logp,
-    "initial_drd2": init_drd2,
-    "optimized_drd2": best_drd2,
-    "similarity": best_similar,
-}).to_csv(output_file, index=False)
+atomic_save_csv(make_results_df(), output_file)
 logger.info(f"Optimized molecules saved to {output_file}")
 
 logger.info("Testing complete!")

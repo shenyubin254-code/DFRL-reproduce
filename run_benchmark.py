@@ -98,10 +98,15 @@ def main():
         raise ValueError("--similarities must contain values between 0 and 1")
 
     output_dir = Path(args.output_dir) if args.output_dir else (
-        Path("benchmark_results") / datetime.now().strftime("%Y%m%d_%H%M%S")
+        Path("benchmark_results") /
+        datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     )
+    if output_dir.exists():
+        raise FileExistsError(
+            f"Benchmark directory already exists: {output_dir}"
+        )
     run_dir = output_dir / "runs"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=False)
 
     run_metrics = []
     molecule_results = []
@@ -116,6 +121,7 @@ def main():
                 )
                 command = [
                     sys.executable,
+                    "-u",
                     "optimize.py",
                     "--epochs_test", str(args.epochs_test),
                     "--swarm_num", str(args.swarm_num),
@@ -134,8 +140,29 @@ def main():
                 if args.allow_individuals_repeat:
                     command.append("--allow_individuals_repeat")
 
-                print(f"Running objective={objective}, similarity={similarity}, seed={seed}", flush=True)
-                subprocess.run(command, check=True)
+                print(
+                    f"Running objective={objective}, "
+                    f"similarity={similarity}, seed={seed}",
+                    flush=True
+                )
+                log_file = result_file.with_suffix(".log")
+                with log_file.open("x", encoding="utf-8") as log_stream:
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                    )
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                        log_stream.write(line)
+                        log_stream.flush()
+                    return_code = process.wait()
+                if return_code != 0:
+                    raise subprocess.CalledProcessError(return_code, command)
 
                 with result_file.open(newline="") as result_stream:
                     results = list(csv.DictReader(result_stream))
@@ -146,13 +173,16 @@ def main():
                     "seed": seed,
                     **row,
                 } for row in results)
+                write_csv(
+                    output_dir / "per_run_metrics.csv",
+                    run_metrics)
+                write_csv(
+                    output_dir / "summary.csv",
+                    aggregate_metrics(run_metrics))
+                write_csv(
+                    output_dir / "all_molecule_results.csv",
+                    molecule_results)
 
-    summary = aggregate_metrics(run_metrics)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_csv(output_dir / "per_run_metrics.csv", run_metrics)
-    write_csv(output_dir / "summary.csv", summary)
-    write_csv(output_dir / "all_molecule_results.csv", molecule_results)
     print(f"Benchmark results saved to {output_dir}")
 
 
@@ -185,19 +215,22 @@ def aggregate_metrics(run_metrics):
 def write_csv(path, rows):
     if not rows:
         raise ValueError(f"Cannot write empty CSV: {path}")
-    with path.open("w", newline="") as output_stream:
-        fieldnames = list(dict.fromkeys(
-            key
-            for row in rows
-            for key in row
-        ))
-
+    fieldnames = list(dict.fromkeys(
+        key
+        for row in rows
+        for key in row
+    ))
+    temp_path = path.with_name(path.name + ".tmp")
+    with temp_path.open(
+        "w", newline="", encoding="utf-8"
+    ) as output_stream:
         writer = csv.DictWriter(
             output_stream,
             fieldnames=fieldnames
         )
         writer.writeheader()
         writer.writerows(rows)
+    temp_path.replace(path)
 
 
 if __name__ == "__main__":
