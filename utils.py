@@ -8,6 +8,7 @@ import time
 
 import requests
 import torch
+import numpy as np
 
 ORACLE_HOST = os.environ.get("ORACLE_HOST", "http://localhost:5000")
 
@@ -218,12 +219,11 @@ def record_operating_parameters(logger, args):
 
 
 def setup_seed(seed):
-    if seed != 0:
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-        torch.backends.cudnn.deterministic = True
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
 
 
 def get_parse():
@@ -252,6 +252,8 @@ def get_parse():
     parser.add_argument("--allow_individuals_repeat", action="store_true")
 
     parser.add_argument("--data_fname_test", type=str, default="")
+    parser.add_argument("--output_file", type=str, default="",
+                        help="Path for the optimization results CSV. Defaults to a timestamped file in results/.")
     parser.add_argument("--sample_size", type=int, default=3000)
     parser.add_argument("--gpu_num", type=int, default=8)
 

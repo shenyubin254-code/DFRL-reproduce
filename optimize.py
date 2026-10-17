@@ -1,5 +1,9 @@
 import re
+from datetime import datetime
+from pathlib import Path
 
+import torch
+import pandas as pd
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from rdkit import Chem, DataStructs
 from rdkit.Chem import QED, AllChem, Descriptors
@@ -94,6 +98,7 @@ best_qed = []
 best_logp = []
 best_drd2 = []
 best_similar = []
+best_smiles = []
 
 for step, one_sm in tqdm(enumerate(test_data.smiles), total=len(test_data.smiles), desc="init..."):
     swarms.append([one_sm] * swarm_num)
@@ -118,8 +123,9 @@ for step, one_sm in tqdm(enumerate(test_data.smiles), total=len(test_data.smiles
         init_fitness.append(one_sm_drd2)
         best_fitness.append(one_sm_drd2)
     else:
-        init_fitness.append(-100)
-        best_fitness.append(-100)
+        initial_multi_fitness = min(one_sm_qed, 0.6) + min(one_sm_drd2, 0.5)
+        init_fitness.append(initial_multi_fitness)
+        best_fitness.append(initial_multi_fitness)
 
     swarms_qed.append([one_sm_qed] * swarm_num)
     swarms_logp.append([one_sm_logp] * swarm_num)
@@ -128,7 +134,8 @@ for step, one_sm in tqdm(enumerate(test_data.smiles), total=len(test_data.smiles
     best_qed.append(one_sm_qed)
     best_logp.append(one_sm_logp)
     best_drd2.append(one_sm_drd2)
-    best_similar.append(0)
+    best_similar.append(1)
+    best_smiles.append(one_sm)
 
 for epoch_i in trange(0, epochs):
     valid_num = 0
@@ -167,7 +174,7 @@ for epoch_i in trange(0, epochs):
 
         model_inputs = tokenizer(input_ids_list, return_tensors="pt", padding=True, truncation=True).to('cuda')
 
-        generated_ids = model_spa.generate(model_inputs.input_ids,
+        generated_ids = model_spa.generate(model_inputs.input_ids,attention_mask=model_inputs.attention_mask,
                                            max_new_tokens=args.spa_max_length,
                                            do_sample=True, top_p=0.97)
         generated_ids = [
@@ -215,6 +222,7 @@ for epoch_i in trange(0, epochs):
             model_inputs = tokenizer([input_ids], return_tensors="pt").to('cuda')
 
             generated_ids = model_dcr.generate(model_inputs.input_ids,
+                                               attention_mask=model_inputs.attention_mask,
                                                max_new_tokens=args.dcr_max_length)
             generated_ids = [
                 output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
@@ -281,7 +289,7 @@ for epoch_i in trange(0, epochs):
 
         temp_swarm_fitness = []
         for k in range(len(temp_swarm_qed)):
-            if temp_similar[k] <= args.min_similar:
+            if temp_similar[k] < args.min_similar:
                 if args.opti_object == "qed&drd2":
                     temp_swarm_fitness.append(-100)
                 else:
@@ -295,9 +303,7 @@ for epoch_i in trange(0, epochs):
                 elif args.opti_object == "drd2":
                     f = temp_swarm_drd2[k]
                 elif args.opti_object == "qed&drd2":
-                    f_drd2 = temp_swarm_drd2[k]
-                    f_qed = temp_swarm_qed[k]
-                    f = -(max(0, 0.6 - f_qed) + max(0, 0.5 - f_drd2))
+                    f = min(temp_swarm_qed[k], 0.6) + min(temp_swarm_drd2[k], 0.5)
                 temp_swarm_fitness.append(f)
 
         molecular_data = list(zip(temp_swarm, temp_swarm_fitness, temp_swarm_qed, temp_similar, temp_swarm_logp,
@@ -320,6 +326,7 @@ for epoch_i in trange(0, epochs):
             best_logp[step] = top_5_swarm_logp[max_index]
             best_drd2[step] = top_5_swarm_drd2[max_index]
             best_similar[step] = top_5_swarm_similar[max_index]
+            best_smiles[step] = top_5_swarm[max_index]
 
         swarms[step] = top_5_swarm
         swarms_qed[step] = top_5_swarm_qed
@@ -336,5 +343,29 @@ fitness_pairs = [[init_fitness[i], best_fitness[i]] for i in range(len(best_fitn
 similar_pairs = [[1, best_similar[i]] for i in range(len(best_similar))]
 
 end_epoch_log(args, logger, qed_pairs, logp_pairs, drd2_pairs, fitness_pairs, similar_pairs)
+
+if args.output_file:
+    output_file = Path(args.output_file)
+else:
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    output_file = Path("results") / (
+        f"optimized_{args.opti_object}_{args.epochs_test}_{int(10 * args.min_similar)}_{timestamp}.csv"
+    )
+
+output_file.parent.mkdir(parents=True, exist_ok=True)
+pd.DataFrame({
+    "input_smiles": test_data.smiles,
+    "optimized_smiles": best_smiles,
+    "initial_fitness": init_fitness,
+    "optimized_fitness": best_fitness,
+    "initial_qed": init_qed,
+    "optimized_qed": best_qed,
+    "initial_logp": init_logp,
+    "optimized_logp": best_logp,
+    "initial_drd2": init_drd2,
+    "optimized_drd2": best_drd2,
+    "similarity": best_similar,
+}).to_csv(output_file, index=False)
+logger.info(f"Optimized molecules saved to {output_file}")
 
 logger.info("Testing complete!")
