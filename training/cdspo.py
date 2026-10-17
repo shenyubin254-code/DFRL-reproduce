@@ -7,7 +7,11 @@ from datasets import load_dataset, concatenate_datasets
 from rdkit import Chem
 from rdkit.Chem import QED, Descriptors
 from trl import GRPOConfig, GRPOTrainer
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainerCallback
+)
 from rdkit import RDLogger
 
 from utils import get_parse, set_logger, record_operating_parameters, setup_seed, get_prompt, \
@@ -31,6 +35,22 @@ CURR_LISTS = [
     [20000, 30000, 40000, 50000, 60000],
     [10000, 20000, 30000, 50000, 90000],
 ]
+
+
+class AlternatingStopCallback(TrainerCallback):
+    def __init__(self, interval):
+        self.interval = interval
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if (
+            state.global_step > 0
+            and state.global_step % self.interval == 0
+            and state.global_step < state.max_steps
+        ):
+            control.should_save = True
+            control.should_training_stop = True
+
+        return control
 
 
 def spa_prompt(x):
@@ -337,7 +357,10 @@ for stage_idx, curr_list in enumerate(CURR_LISTS):
         lr_scheduler_type="cosine",
         logging_steps=100,
         max_steps=STEPS_PER_STAGE,
-        save_steps=5000,
+        save_strategy="steps",
+        save_steps=STEPS_PER_SWITCH,
+        save_only_model=False,
+        save_total_limit=2,
         gradient_accumulation_steps=1,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -358,15 +381,24 @@ for stage_idx, curr_list in enumerate(CURR_LISTS):
         train_dataset=spa_train_test['train'],
         eval_dataset=spa_train_test['test'],
         peft_config=None,
+        callbacks=[
+            AlternatingStopCallback(STEPS_PER_SWITCH)
+        ],
     )
 
     dcr_training_args = GRPOConfig(
-        output_dir="dcr_grpo_model/" + checkpoint_save_path,
+        output_dir=os.path.join(
+            "dcr_grpo_model",
+            f"{checkpoint_save_path}_stage_{stage_idx}"
+        ),
         learning_rate=5e-7,
         lr_scheduler_type="cosine",
         logging_steps=10,
         max_steps=STEPS_PER_STAGE,
-        save_steps=1000,
+        save_strategy="steps",
+        save_steps=STEPS_PER_SWITCH,
+        save_only_model=False,
+        save_total_limit=2,
         gradient_accumulation_steps=1,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -386,24 +418,66 @@ for stage_idx, curr_list in enumerate(CURR_LISTS):
         train_dataset=dcr_train_test['train'],
         eval_dataset=dcr_train_test['test'],
         peft_config=None,
+        callbacks=[
+            AlternatingStopCallback(STEPS_PER_SWITCH)
+        ],
     )
 
-    for block in range(num_blocks_per_stage):
-        steps = (block + 1) * STEPS_PER_SWITCH
+    spa_checkpoint = None
+    dcr_checkpoint = None
 
+    for block in range(num_blocks_per_stage):
+        target_step = (block + 1) * STEPS_PER_SWITCH
+
+        # ===== Train SPA =====
         dcr_model.requires_grad_(False)
         dcr_model.eval()
+
         spa_model.requires_grad_(True)
         spa_model.train()
-        print(f"[Stage {stage_idx + 1}] SPA block {block + 1}/{num_blocks_per_stage} -> step {steps}")
-        trainer_spa.train(max_steps=steps)
 
+        trainer_spa.train(
+            resume_from_checkpoint=spa_checkpoint
+        )
+
+        if trainer_spa.state.global_step != target_step:
+            raise RuntimeError(
+                f"SPA step mismatch: expected {target_step}, "
+                f"got {trainer_spa.state.global_step}"
+            )
+
+        spa_checkpoint = os.path.join(
+            spa_training_args.output_dir,
+            f"checkpoint-{target_step}"
+        )
+
+        if not os.path.isdir(spa_checkpoint):
+            raise FileNotFoundError(spa_checkpoint)
+
+        # ===== Train DCR =====
         spa_model.requires_grad_(False)
         spa_model.eval()
+
         dcr_model.requires_grad_(True)
         dcr_model.train()
-        print(f"[Stage {stage_idx + 1}] DCR block {block + 1}/{num_blocks_per_stage} -> step {steps}")
-        trainer_dcr.train(max_steps=steps)
+
+        trainer_dcr.train(
+            resume_from_checkpoint=dcr_checkpoint
+        )
+
+        if trainer_dcr.state.global_step != target_step:
+            raise RuntimeError(
+                f"DCR step mismatch: expected {target_step}, "
+                f"got {trainer_dcr.state.global_step}"
+            )
+
+        dcr_checkpoint = os.path.join(
+            dcr_training_args.output_dir,
+            f"checkpoint-{target_step}"
+        )
+
+        if not os.path.isdir(dcr_checkpoint):
+            raise FileNotFoundError(dcr_checkpoint)
 
     trainer_spa.save_model(spa_training_args.output_dir)
     trainer_dcr.save_model(dcr_training_args.output_dir)

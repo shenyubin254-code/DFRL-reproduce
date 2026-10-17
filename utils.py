@@ -10,11 +10,11 @@ import requests
 import torch
 import numpy as np
 
-ORACLE_HOST = os.environ.get("ORACLE_HOST", "http://localhost:5000")
+ORACLE_HOST = os.environ.get("ORACLE_HOST", "http://localhost:5002")
 
 
 def drd2_predict_oracle(sl):
-    response = requests.post(ORACLE_HOST + "/predict_drd2", json={"SMILES_LIST": sl})
+    response = requests.post(ORACLE_HOST + "/predict", json={"SMILES_LIST": sl})
     result_list = ast.literal_eval(response.json()["result"])
     if isinstance(result_list, float):
         return result_list
@@ -186,6 +186,7 @@ def set_logger(name=""):
     rq = time.strftime("%Y%m%d%H%M", time.localtime(time.time()))
     random_number = random.randint(1000, 9999)
     log_name = "./log/" + name + "_" + rq + "_" + str(random_number) + ".log"
+    os.makedirs("./log", exist_ok=True)
     fh = logging.FileHandler(log_name, mode="w")
     fh.setLevel(logging.DEBUG)
     formatter = logging.Formatter("%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s")

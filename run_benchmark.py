@@ -186,7 +186,16 @@ def write_csv(path, rows):
     if not rows:
         raise ValueError(f"Cannot write empty CSV: {path}")
     with path.open("w", newline="") as output_stream:
-        writer = csv.DictWriter(output_stream, fieldnames=list(rows[0]))
+        fieldnames = list(dict.fromkeys(
+            key
+            for row in rows
+            for key in row
+        ))
+
+        writer = csv.DictWriter(
+            output_stream,
+            fieldnames=fieldnames
+        )
         writer.writeheader()
         writer.writerows(rows)
 

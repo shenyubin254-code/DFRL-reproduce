@@ -83,6 +83,19 @@ def safe_decode(g_id, tknz):
     return tknz_list
 
 
+def is_valid_single_mask(source_smiles, masked_smiles):
+    if masked_smiles.count("<|mask|>") != 1:
+        return False
+
+    prefix, suffix = masked_smiles.split("<|mask|>")
+
+    return (
+        source_smiles.startswith(prefix)
+        and source_smiles.endswith(suffix)
+        and len(prefix) + len(suffix) < len(source_smiles)
+    )
+
+
 swarms = []
 swarms_qed = []
 swarms_logp = []
@@ -186,16 +199,25 @@ for epoch_i in trange(0, epochs):
         one_swarm_mask = [one_smiles.replace('Q', '&') for one_smiles in one_swarm_mask]
 
         for sss in range(len(one_swarm_mask)):
-            one_smiles = one_swarm_mask[sss]
+            masked = one_swarm_mask[sss]
+            original = one_swarm[sss]
 
-            if ('<|mask|>' not in one_smiles) or ('\n' in one_smiles) or (one_smiles.count('<|mask|>') > 1):
+            if (
+                masked.count("<|mask|>") != 1
+                or "\n" in masked
+            ):
                 one_swarm_mask[sss] = random_one_swarm_mask[sss]
                 continue
 
-            remained_chars = one_smiles.replace('<|mask|>', '')
-            is_legal = all(char in allowed_chars for char in remained_chars)
-            if not is_legal:
+            remained_chars = masked.replace("<|mask|>", "")
+
+            if not all(c in allowed_chars for c in remained_chars):
                 one_swarm_mask[sss] = random_one_swarm_mask[sss]
+                continue
+
+            if not is_valid_single_mask(original, masked):
+                one_swarm_mask[sss] = random_one_swarm_mask[sss]
+                continue
 
         new_one_swarm = []
         new_one_swarm_qed = []
@@ -290,21 +312,19 @@ for epoch_i in trange(0, epochs):
         temp_swarm_fitness = []
         for k in range(len(temp_swarm_qed)):
             if temp_similar[k] < args.min_similar:
-                if args.opti_object == "qed&drd2":
-                    temp_swarm_fitness.append(-100)
-                else:
-                    temp_swarm_fitness.append(0)
-            else:
-                f = 0
-                if args.opti_object == "qed":
-                    f = temp_swarm_qed[k]
-                elif args.opti_object == "plogp":
-                    f = temp_swarm_logp[k]
-                elif args.opti_object == "drd2":
-                    f = temp_swarm_drd2[k]
-                elif args.opti_object == "qed&drd2":
-                    f = min(temp_swarm_qed[k], 0.6) + min(temp_swarm_drd2[k], 0.5)
-                temp_swarm_fitness.append(f)
+                temp_swarm_fitness.append(float("-inf"))
+                continue
+
+            f = 0
+            if args.opti_object == "qed":
+                f = temp_swarm_qed[k]
+            elif args.opti_object == "plogp":
+                f = temp_swarm_logp[k]
+            elif args.opti_object == "drd2":
+                f = temp_swarm_drd2[k]
+            elif args.opti_object == "qed&drd2":
+                f = min(temp_swarm_qed[k], 0.6) + min(temp_swarm_drd2[k], 0.5)
+            temp_swarm_fitness.append(f)
 
         molecular_data = list(zip(temp_swarm, temp_swarm_fitness, temp_swarm_qed, temp_similar, temp_swarm_logp,
                                   temp_swarm_drd2))
