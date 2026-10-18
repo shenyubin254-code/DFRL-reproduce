@@ -22,6 +22,9 @@ from utils import get_parse, setup_seed, \
     set_logger, get_prompt
 from load_data import load_test_data
 from oracle.drd2_svm import predict_drd2
+from checkpointing import (experiment_identity, save_checkpoint, load_checkpoint,
+                           restore_checkpoint, mark_complete, sha256, atomic_bytes)
+import os
 
 RDLogger.DisableLog('rdApp.*')
 
@@ -49,12 +52,20 @@ else:
         f"{int(10 * args.min_similar)}_{timestamp}.csv"
     )
 details_dir = output_file.parent / f"{output_file.stem}_details"
-if output_file.exists() or details_dir.exists():
+if args.resume and not args.output_file:
+    raise ValueError("--resume requires --output_file")
+if not args.resume and (output_file.exists() or details_dir.exists()):
     raise FileExistsError(
         f"Experiment output already exists: {output_file}"
     )
 output_file.parent.mkdir(parents=True, exist_ok=True)
-details_dir.mkdir(parents=True, exist_ok=False)
+if args.resume and not details_dir.is_dir():
+    raise FileNotFoundError(f"No existing run to resume: {details_dir}")
+details_dir.mkdir(parents=True, exist_ok=args.resume)
+checkpoint_file = details_dir / "checkpoint.pkl"
+complete_file = details_dir / "complete.json"
+if args.resume and not checkpoint_file.exists():
+    raise FileNotFoundError("No resumable checkpoint. Legacy history CSV is not a full population/RNG checkpoint.")
 history_file = details_dir / "best_history.csv"
 progress_file = details_dir / "progress.csv"
 metrics_file = details_dir / "epoch_metrics.csv"
@@ -95,6 +106,8 @@ if args.data_fname_test == "":
         args.data_fname_test = 'data/standard_test_data/drd2qed_test.csv'
 
 test_data, test_data_size = load_test_data(args)
+if test_data_size == 0 or args.epochs_test < 1 or args.swarm_num < 1:
+    raise ValueError("Data, epochs_test and swarm_num must be nonempty/positive")
 logger.info("loading test end")
 
 
@@ -120,11 +133,19 @@ config = {
     "torch_version": torch.__version__,
     "transformers_version": transformers.__version__,
     "rdkit_version": rdBase.rdkitVersion,
+    "similarity_rule": "Morgan count radius=2, Tanimoto > min_similar (author code)",
 }
-config_file.write_text(
-    json.dumps(config, ensure_ascii=False, indent=2),
-    encoding="utf-8"
-)
+identity = experiment_identity(args)
+resume_state = load_checkpoint(checkpoint_file, identity) if args.resume else None
+if args.resume and complete_file.exists():
+    complete = json.loads(complete_file.read_text(encoding="utf-8"))
+    if complete['identity'] != identity or complete['csv_sha256'] != sha256(output_file):
+        raise ValueError("Completed result verification failed")
+    logger.info("Verified completed run; no optimization repeated.")
+    sys.exit(0)
+if not args.resume:
+    config['identity'] = identity
+    config_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 epochs = args.epochs_test
 swarm_num = args.swarm_num
@@ -180,18 +201,18 @@ def make_results_df():
 
 
 def atomic_save_csv(df, path):
-    temp_path = path.with_name(path.name + ".tmp")
-    df.to_csv(temp_path, index=False)
-    temp_path.replace(path)
+    atomic_bytes(path, df.to_csv(index=False).encode("utf-8"))
 
 
 def append_csv_row(path, row):
-    is_new_file = not path.exists()
+    is_new_file = not path.exists() or path.stat().st_size == 0
     with path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
         if is_new_file:
             writer.writeheader()
         writer.writerow(row)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 for step, one_sm in tqdm(enumerate(test_data.smiles), total=len(test_data.smiles), desc="init..."):
@@ -231,18 +252,28 @@ for step, one_sm in tqdm(enumerate(test_data.smiles), total=len(test_data.smiles
     best_similar.append(1)
     best_smiles.append(one_sm)
 
-initial_df = make_results_df()
-initial_df.insert(0, "epoch", 0)
-initial_df.insert(1, "molecule_id", range(len(initial_df)))
-atomic_save_csv(initial_df, progress_file)
-logger.info("Initial molecule results saved")
+start_epoch, start_step = 0, 0
+journals = (history_file, metrics_file)
+if resume_state:
+    restore_checkpoint(resume_state, globals())
+    start_epoch, start_step = resume_state['epoch'], resume_state['step']
+    logger.info(f"Resuming epoch index={start_epoch}, next molecule index={start_step}")
+else:
+    initial_df = make_results_df()
+    initial_df.insert(0, "epoch", 0)
+    initial_df.insert(1, "molecule_id", range(len(initial_df)))
+    atomic_save_csv(initial_df, progress_file)
+    save_checkpoint(checkpoint_file, globals(), identity, 0, 0, (0, 0, 0), journals)
+    logger.info("Initial molecule results and checkpoint saved")
 
-for epoch_i in trange(0, epochs):
-    valid_num = 0
-    mask_total_count = 0
-    mask_fallback_count = 0
+for epoch_i in trange(start_epoch, epochs):
+    valid_num, mask_total_count, mask_fallback_count = (
+        resume_state['counters'] if resume_state and epoch_i == start_epoch else (0, 0, 0)
+    )
 
     for step, one_swarm in enumerate(swarms):
+        if epoch_i == start_epoch and step < start_step:
+            continue
 
         one_swarm_qed = swarms_qed[step]
         one_swarm_logp = swarms_logp[step]
@@ -394,7 +425,7 @@ for epoch_i in trange(0, epochs):
 
         temp_swarm_fitness = []
         for k in range(len(temp_swarm_qed)):
-            if temp_similar[k] < args.min_similar:
+            if temp_similar[k] <= args.min_similar:
                 temp_swarm_fitness.append(float("-inf"))
                 continue
 
@@ -452,6 +483,10 @@ for epoch_i in trange(0, epochs):
             "similarity": best_similar[step],
         }
         append_csv_row(history_file, history_row)
+        save_checkpoint(checkpoint_file, globals(), identity, epoch_i, step + 1,
+                        (valid_num, mask_total_count, mask_fallback_count), journals)
+        if (step + 1) % 50 == 0:
+            logger.info(f"Epoch {epoch_i + 1}/{epochs}, molecule {step + 1}/{test_data_size}: checkpoint saved")
 
     progress_df = make_results_df()
     progress_df.insert(0, "epoch", epoch_i + 1)
@@ -499,6 +534,8 @@ for epoch_i in trange(0, epochs):
             ) / n,
     }
     append_csv_row(metrics_file, metrics_row)
+    save_checkpoint(checkpoint_file, globals(), identity, epoch_i + 1, 0,
+                    (0, 0, 0), journals)
     logger.info(
         f"Epoch {epoch_i + 1}/{epochs}: "
         f"valid_rate={metrics_row['valid_generation_rate']:.4f}, "
@@ -511,9 +548,9 @@ drd2_pairs = [[init_drd2[i], best_drd2[i]] for i in range(len(best_drd2))]
 fitness_pairs = [[init_fitness[i], best_fitness[i]] for i in range(len(best_fitness))]
 similar_pairs = [[1, best_similar[i]] for i in range(len(best_similar))]
 
-end_epoch_log(args, logger, qed_pairs, logp_pairs, drd2_pairs, fitness_pairs, similar_pairs)
-
 atomic_save_csv(make_results_df(), output_file)
+mark_complete(complete_file, output_file, identity, test_data_size)
 logger.info(f"Optimized molecules saved to {output_file}")
+end_epoch_log(args, logger, qed_pairs, logp_pairs, drd2_pairs, fitness_pairs, similar_pairs)
 
 logger.info("Testing complete!")

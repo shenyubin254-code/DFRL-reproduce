@@ -22,5 +22,7 @@ tokenizer files.
 
 The DRD2 oracle (`clf_py36.pkl`) is an sklearn SVC trained on DRD2 activity
 data from ExCAPE (obtained via [TDC](https://tdcommons.ai/)); its inference
-code is `oracle/drd2_svm.py` and has been verified to reproduce the DRD2
-values of the paper exactly. No oracle weights are committed to the repo.
+code is `oracle/drd2_svm.py`. Loading the legacy SVC through compatibility
+patches does not by itself establish agreement with the paper: reference
+predictions and the exact oracle/environment version should be requested
+from the authors. No oracle weights are committed to the repo.

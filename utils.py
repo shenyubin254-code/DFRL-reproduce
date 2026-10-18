@@ -53,13 +53,13 @@ def end_epoch_log(args, logger, qed_pairs, logp_pairs, drd2_pairs, fitness_pairs
         bbb = 0
         for i in qed_pairs:
             num = num + 1
-            if i[-1] > 0.9:
+            if i[-1] >= 0.9:
                 aaa = aaa + 1
-            if i[-1] - i[0] > 0.1:
+            if i[-1] - i[0] >= 0.1:
                 bbb = bbb + 1
-        logger.info("qed > 0.9 ratio")
+        logger.info("qed >= 0.9 ratio")
         logger.info(aaa / num)
-        logger.info("qed improvement > 0.1 ratio")
+        logger.info("qed improvement >= 0.1 ratio")
         logger.info(bbb / num)
 
         count_better = 0
@@ -72,7 +72,7 @@ def end_epoch_log(args, logger, qed_pairs, logp_pairs, drd2_pairs, fitness_pairs
             logger.info("improvement ratio")
             logger.info(count_better / num)
             logger.info("average improvement")
-            logger.info(sum(better_average) / len(better_average))
+            logger.info(sum(better_average) / len(better_average) if better_average else "N/A (no improvements)")
 
     if args.opti_object in ("logp", "plogp"):
         before = []
@@ -101,13 +101,13 @@ def end_epoch_log(args, logger, qed_pairs, logp_pairs, drd2_pairs, fitness_pairs
         aaa_d = 0
         for i in drd2_pairs:
             num_d = num_d + 1
-            if i[-1] > 0.5:
+            if i[-1] >= 0.5:
                 aaa_q = aaa_q + 1
-            if i[-1] - i[0] > 0.2:
+            if i[-1] - i[0] >= 0.2:
                 aaa_d = aaa_d + 1
-        logger.info("drd2 > 0.5 ratio")
+        logger.info("drd2 >= 0.5 ratio")
         logger.info(aaa_q / num_d)
-        logger.info("drd2 improvement > 0.2 ratio")
+        logger.info("drd2 improvement >= 0.2 ratio")
         logger.info(aaa_d / num_d)
 
     if args.opti_object == "qed&drd2":
@@ -255,6 +255,8 @@ def get_parse():
     parser.add_argument("--data_fname_test", type=str, default="")
     parser.add_argument("--output_file", type=str, default="",
                         help="Path for the optimization results CSV. Defaults to a timestamped file in results/.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume the same output_file from its local checkpoint.")
     parser.add_argument("--sample_size", type=int, default=3000)
     parser.add_argument("--gpu_num", type=int, default=8)
 

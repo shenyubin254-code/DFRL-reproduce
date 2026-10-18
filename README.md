@@ -1,5 +1,28 @@
 # DFRL-Mol
 
+## Current staged reproduction
+
+The current default is **QED, similarity 0.6, seed 0 only**, with the full
+test set, 20 iterations and population size 20. This is a single-seed staged
+reproduction, not a replacement for repeated-run statistics.
+
+The full staged plan covers `qed`, `plogp` (ordinary logP), `drd2`, and
+`qed&drd2` at 0.4 and 0.6, each with seed 0. Start with QED/0.6;
+`bash run_group.sh OBJECTIVE SIMILARITY [--resume]` selects one group and
+never automatically launches the next. Activate `dfrl39` on the server or
+`dfrl-local` in local WSL first. See RUN_GUIDE.md for the ordered plan.
+
+```bash
+python -u run_benchmark.py --objectives qed --similarities 0.6 --runs 1 --seed_start 0 --output_dir benchmark_results/qed_06_seed0
+# Resume the same experiment after interruption:
+python -u run_benchmark.py --objectives qed --similarities 0.6 --runs 1 --seed_start 0 --output_dir benchmark_results/qed_06_seed0 --resume
+```
+
+See [the run guide](RUN_GUIDE.md) for tmux, WSL lifetime, output locations,
+checkpoint limitations, and metric verification; see [the audit](AUDIT_20261018.md)
+for recovered results and protocol differences. No full benchmark is started
+automatically. The commands below describe the broader repeated-run scope.
+
 You can find model file from: https://drive.google.com/file/d/1Sf7OBl_CpmoVlLeAPIpQmmicMGTGrza6/view?usp=drive_link
 
 ## Requirements

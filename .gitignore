@@ -36,3 +36,8 @@ trainer_output/
 # Experiment results
 results/
 benchmark_results/
+logs/
+audit_*/
+recovered_partial/
+*.pkl
+*.safetensors
